@@ -1,5 +1,6 @@
 CC = gcc
-CFLAGS = -D_DEFAULT_SOURCE -fvisibility=hidden -Wall -Wextra -O3 -Iinclude
+# modify O0 -g to 03 in production
+CFLAGS = -D_DEFAULT_SOURCE -fvisibility=hidden -Wall -Wextra -O0 -g -Iinclude
 PKG_CFLAGS = $(shell pkg-config --cflags glib-2.0 libpcap libndpi librrd 2>/dev/null)
 PKG_LIBS = $(shell pkg-config --libs glib-2.0 libpcap libndpi librrd 2>/dev/null)
 

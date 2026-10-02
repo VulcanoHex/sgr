@@ -9,60 +9,21 @@
 #include <netinet/udp.h>
 #include <netinet/if_ether.h>
 #include <arpa/inet.h>
-#include <ndpi/ndpi.h>
+#include <ndpi_includes.h>
+#include <stdnoreturn.h>
 #include <string.h>
 #include <sys/types.h>
-
-// Struct per il contesto nel pcap callback
-typedef struct{
-    struct ndpi_detection_module_struct *ndpi_struct;
-    // altri dati da mettere nel detector vanno qui
-} pcap_context_t;
-
-// Struct per identificare univocamente un flusso (only IPV4)
-typedef struct {
-    uint8_t layer4_protocol;    // Protocollo L4 (TCP/UDP)
-    uint32_t src_ip;            // IP sorgente (network order)
-    uint32_t dst_ip;            // IP destinazione (network order)
-    uint16_t src_port;          // Porta sorgente (network order)
-    uint16_t dst_port;          // Porta destinazione (network order)
-} flow_t;
-
-
-/*
- * Test callback
- * */
-// void packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
-//     printf("Packet Length: %d\n", pkthdr->len);
-//     struct iphdr *ip_header = (struct iphdr *)(packet + 14);
-//     printf("IP Header: %d\n", ip_header->version);
-//     printf("Source IP: %d\n", ip_header->saddr);
-//     printf("Destination IP: %d\n", ip_header->daddr);
-
-// }
-
-// void ingest_packets_file(const char *filename, pcap_context_t *pcap_context){
-//     char errbuf[PCAP_ERRBUF_SIZE];
-//     pcap_t *handle = pcap_open_offline(filename, errbuf);
-//     printf("Poc Test");
-
-//     if (handle == NULL) {
-//         fprintf(stderr, "Error: %s\n", errbuf);
-//     }
-//     pcap_loop(handle, -1, packet_callback, pcap_context);
-
-//     pcap_close(handle);
-// }
-
+#include "common.h"
 
 /**
- * Genera un flusso normalizzato a partire dal pacchetto fornito. Usato come chiave per hashmaps (UTHash?).
+ * Genera un flusso non normalizzato a partire dal pacchetto fornito.
+ * Usato come chiave per hashmaps (UTHash?).
  *
  * @param caplen Lunghezza del pacchetto
  * @param packet Puntatore al pacchetto
- * @return flow_t Flusso normalizzato
+ * @return flow_t Flusso non normalizzato
  */
-flow_t create_normalized_flow(uint16_t caplen, const u_char *packet) {
+flow_t create_flow(uint16_t caplen, const u_char *packet) {
     flow_t flow = {0};
 
     // Analizzo il pacchetto fino al Layer Trasporto
@@ -130,22 +91,49 @@ flow_t create_normalized_flow(uint16_t caplen, const u_char *packet) {
         dst_port = udp->dest;
     }
 
-    // Normalizzo il flusso, invertendo src/dst se necessario (condizione d'ordinamento src_ip < dst_ip, in caso di parita src_port < dst_port)
-    if ((src_ip < dst_ip) || (src_ip == dst_ip && src_port < dst_port)) {
-        flow.src_ip = src_ip;
-        flow.dst_ip = dst_ip;
-        flow.src_port = src_port;
-        flow.dst_port = dst_port;
-        flow.layer4_protocol = l4_proto;
-    } else {
-        flow.src_ip = dst_ip;
-        flow.dst_ip = src_ip;
-        flow.src_port = dst_port;
-        flow.dst_port = src_port;
-        flow.layer4_protocol = l4_proto;
-    }
+    flow.local_ip = src_ip;
+    flow.remote_ip = dst_ip;
+    flow.local_port = src_port;
+    flow.remote_port = dst_port;
+    flow.layer4_protocol = l4_proto;
 
     return flow;
+}
+
+/*
+ * Normalizzazione da usare in produzione
+ * local_ip: indirizzo IP INBOUND (in offline mode: fornito dall'utente, in online mode: ottenuto automaticamente tramite interfaccia di rete)
+ */
+flow_t normalize_topologic_flow(flow_t flow, uint32_t local_ip) {
+    if (flow.local_ip != local_ip) {
+        uint32_t temp_ip = flow.local_ip;
+        flow.local_ip = flow.remote_ip;
+        flow.remote_ip = temp_ip;
+        uint16_t temp_port = flow.local_port;
+        flow.local_port = flow.remote_port;
+        flow.remote_port = temp_port;
+    }
+    return flow;
+}
+
+/*
+ * Normalizzazione usata per TESTING ONLY (perde informazioni su inbound/outbound)
+ * Normalizza il flusso invertendo local/remote se necessario
+ */
+flow_t normalize_num_flow(flow_t flow) {
+    if (flow.local_ip > flow.remote_ip || (flow.local_ip == flow.remote_ip && flow.local_port > flow.remote_port)) {
+        uint32_t temp_ip = flow.local_ip;
+        uint16_t temp_port = flow.local_port;
+        flow.local_ip = flow.remote_ip;
+        flow.remote_ip = temp_ip;
+        flow.local_port = flow.remote_port;
+        flow.remote_port = temp_port;
+    }
+    return flow;
+}
+
+// online mode
+uint32_t get_local_ip_from_interface(CaptureContext *ctx) {
 }
 
 
@@ -156,18 +144,27 @@ flow_t create_normalized_flow(uint16_t caplen, const u_char *packet) {
  * Deve essere thread-safe.
  * Tutti i dati in analisi devono essere nell'pointer user (pcap_context_t).
  */
-void packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
-    // Casto il pointer user a pcap_context_t
-    pcap_context_t *pcap_context = (pcap_context_t *)user;
+void offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
+    // Casto il pointer user a CaptureContext
+    CaptureContext *ctx = (CaptureContext *)user;
     // Estraggo il detection module
-    struct ndpi_detection_module_struct *ndpi_struct = pcap_context->ndpi_struct;
+    struct ndpi_detection_module_struct *ndpi_struct = ctx->ndpi_struct;
 
     // Estraggo lunghezza e timestamp del pacchetto
     uint16_t caplen = pkthdr->caplen;
     uint64_t time_ms = pkthdr->ts.tv_sec * 1000 + pkthdr->ts.tv_usec / 1000;
 
     // Estraggo il flusso dal pacchetto
-    flow_t flow = create_normalized_flow(caplen, packet);
+    flow_t flow = create_flow(caplen, packet);
+    // Normalizzo il flusso
+    flow = normalize_topologic_flow(flow, ctx->config->local_ip);
+
+    // debug: stampa il flusso
+    printf("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
+        (flow.local_ip >> 24) & 0xFF, (flow.local_ip >> 16) & 0xFF, (flow.local_ip >> 8) & 0xFF, flow.local_ip & 0xFF,
+        flow.local_port,
+        (flow.remote_ip >> 24) & 0xFF, (flow.remote_ip >> 16) & 0xFF, (flow.remote_ip >> 8) & 0xFF, flow.remote_ip & 0xFF,
+        flow.remote_port);
 
     if (flow.layer4_protocol == 0) {
         return;
@@ -175,36 +172,6 @@ void packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_cha
     //...
 
     // Analizzo il pacchetto con NDPI
-    ndpi_protocol prot = ndpi_detection_process_packet(
-        ndpi_struct,
-        flow,
-        packet,     // packet bytes
-        caplen,
-        time_ms
-    );
+    // ndpi_struct
 
-}
-
-
-/*
- * Per ogni pacchetto, nel file pcap, lo passa a discretize.c
- * Dato che tutti i pacchetti sono nel file pcap, usa pcap_loop per iterare su tutti i pacchetti.
- * pcap_context deve essere fornito dal chiamante (il main). Inizializzando ndpi_module_detection
- * WORK IN PROGRESS
- *
- */
-void ingest_pkt_file(const char *filename, pcap_context_t *pcap_context) {
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *handle = pcap_open_offline(filename, errbuf);
-
-    if (handle == NULL) {
-        fprintf(stderr, "Error missing handle: %s\n", errbuf);
-        return;
-    }
-
-    if(pcap_loop(handle, -1, packet_callback, (u_char *)pcap_context) < 0) {
-        fprintf(stderr, "Error: %s\n", pcap_geterr(handle));
-    }
-
-    pcap_close(handle);
 }
