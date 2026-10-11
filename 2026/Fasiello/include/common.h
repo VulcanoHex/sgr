@@ -13,7 +13,6 @@
 #include <netinet/udp.h>
 #include <netinet/if_ether.h>
 #include <arpa/inet.h>
-#include <ndpi_api.h>
 #include <stdnoreturn.h>
 #include <string.h>
 #include <sys/types.h>
