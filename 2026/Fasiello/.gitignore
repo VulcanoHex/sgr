@@ -6,7 +6,7 @@ tests/out/
 *.rrd
 *.pcap
 *.png
-test.pcap
+tests/*
 /tmp/netflow_metrics.rrd
 *.log
 .DS_Store

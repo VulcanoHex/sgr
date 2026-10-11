@@ -12,8 +12,14 @@
 #include <ndpi_includes.h>
 #include <stdnoreturn.h>
 #include <string.h>
+#include <sys/param.h>
 #include <sys/types.h>
 #include "common.h"
+#include "discretizer.h"
+#include "ndpi_api.h"
+#include "ndpi_protocol_ids.h"
+#include "ndpi_typedefs.h"
+#include "uthash.h"
 
 /**
  * Genera un flusso non normalizzato a partire dal pacchetto fornito.
@@ -21,10 +27,12 @@
  *
  * @param caplen Lunghezza del pacchetto
  * @param packet Puntatore al pacchetto
- * @return flow_t Flusso non normalizzato
+ * @return flow_nn_t Flusso non normalizzato
  */
-flow_t create_flow(uint16_t caplen, const u_char *packet) {
-    flow_t flow = {0};
+flow_nn_t create_flow(uint16_t caplen, const u_char *packet) {
+    flow_nn_t flow;
+    // Zero-out memory so that it plays nice with UTHash
+    memset(&flow, 0, sizeof(flow_nn_t));
 
     // Analizzo il pacchetto fino al Layer Trasporto
     // (Analisi della lunghezza del protocollo di trasporto viene eseguita dinamicamente con ihl)
@@ -96,6 +104,7 @@ flow_t create_flow(uint16_t caplen, const u_char *packet) {
     flow.local_port = src_port;
     flow.remote_port = dst_port;
     flow.layer4_protocol = l4_proto;
+    flow.offsetL3 = sizeof(struct ether_header);
 
     return flow;
 }
@@ -104,7 +113,15 @@ flow_t create_flow(uint16_t caplen, const u_char *packet) {
  * Normalizzazione da usare in produzione
  * local_ip: indirizzo IP INBOUND (in offline mode: fornito dall'utente, in online mode: ottenuto automaticamente tramite interfaccia di rete)
  */
-flow_t normalize_topologic_flow(flow_t flow, uint32_t local_ip) {
+flow_t normalize_topologic_flow(flow_nn_t nnflow, uint32_t local_ip) {
+	flow_t flow = {0};
+
+	flow.local_ip = nnflow.local_ip;
+	flow.remote_ip = nnflow.remote_ip;
+	flow.local_port = nnflow.local_port;
+	flow.remote_port = nnflow.remote_port;
+	flow.layer4_protocol = nnflow.layer4_protocol;
+
     if (flow.local_ip != local_ip) {
         uint32_t temp_ip = flow.local_ip;
         flow.local_ip = flow.remote_ip;
@@ -132,8 +149,9 @@ flow_t normalize_num_flow(flow_t flow) {
     return flow;
 }
 
-// online mode
+// online mode THIS IS VERY IMPORTANT
 uint32_t get_local_ip_from_interface(CaptureContext *ctx) {
+    return 0;
 }
 
 
@@ -155,9 +173,10 @@ void offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, con
     uint64_t time_ms = pkthdr->ts.tv_sec * 1000 + pkthdr->ts.tv_usec / 1000;
 
     // Estraggo il flusso dal pacchetto
-    flow_t flow = create_flow(caplen, packet);
+    flow_nn_t flow_nn = create_flow(caplen, packet);
+    uint16_t l3offset = flow_nn.offsetL3;
     // Normalizzo il flusso
-    flow = normalize_topologic_flow(flow, ctx->config->local_ip);
+    flow_t flow = normalize_topologic_flow(flow_nn, ctx->config->local_ip);
 
     // debug: stampa il flusso
     printf("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",

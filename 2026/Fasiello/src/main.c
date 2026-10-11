@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include "ingester.h"
+#include "discretizer.h"
 #include "common.h"
 
 static void print_usage() {
@@ -115,6 +116,9 @@ int main(int argc, char *argv[]) {
         CaptureContext ctx;
         ctx.handle = handle;
         ctx.config = &config;
+        memset(&ctx.markov, 0, sizeof(markov_model_t));
+        ctx.markov.last_state = -1;
+
         if (init_ndpi_engine(&ctx) != 0) {
             fprintf(stderr, "Error: Failed to initialize NDPI engine\n");
             free_config(&config);
@@ -122,6 +126,32 @@ int main(int argc, char *argv[]) {
         }
 
         pcap_loop(handle, -1, offline_packet_callback,(u_char *) &ctx);
+
+        // Post-processing: normalize and print global Markov transition probability matrix 
+        printf("\n=== Global Markov Transition Probability Matrix ===\n\n");
+        double prob_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
+        normalize_markov_matrix(ctx.markov.transition_matrix, prob_matrix);
+
+        // Print state labels 
+        printf("       ");
+        for (int j = 0; j < MARKOV_STATE_SPACE; j++) {
+            printf("%5d ", j);
+        }
+        printf("\n");
+
+        // Print probability matrix 
+        for (int i = 0; i < MARKOV_STATE_SPACE; i++) {
+            printf("  %2d|", i);
+            for (int j = 0; j < MARKOV_STATE_SPACE; j++) {
+                if (prob_matrix[i][j] > 0.0) {
+                    printf("%5.3f ", prob_matrix[i][j]);
+                } else {
+                    printf("    - ");
+                }
+            }
+            printf("\n");
+        }
+        printf("\n");
 
         pcap_close(handle);
         return 0;
