@@ -1,6 +1,7 @@
 // this should discretize packet from ingester
 // also handle identified flow data structure
 #include "discretizer.h"
+#include "common.h"
 #include "ndpi_api.h"
 #include <stdint.h>
 
@@ -86,6 +87,49 @@ uint8_t compute_markov_state(int direction, uint16_t caplen) {
 }
 
 /*
+ * Infinity Norm for the Markov transition count matrix
+ * (assumes the elements are always >= 0 since is counting)
+ * @param count_matrix	Transition matrix
+ * @return infinity_norm
+ */
+uint64_t infinity_norm(uint32_t count_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE]){
+	uint64_t max_row = 0;
+	for(int i = 0; i < MARKOV_STATE_SPACE; i++){
+		uint64_t curr_row = 0;
+		for(int j = 0; j < MARKOV_STATE_SPACE; j++){
+			curr_row += count_matrix[i][j];
+		}
+		if (curr_row >= max_row){
+			max_row = curr_row;
+		}
+	}
+	return max_row;
+}
+
+/*
+ * Infinity norm of the difference between two probability matrices ||A - B||_inf
+ * (assumes the elements are always >= 0)
+ * @param A	double matrix
+ * @param B	double matrix
+ * @return infinity_norm
+ */
+double delta_prob_norm(double a[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE], double b[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE]){
+	double max_row_sum = 0.0;
+
+    for (int i = 0; i < MARKOV_STATE_SPACE; i++) {
+        double current_row_sum = 0.0;
+        for (int j = 0; j < MARKOV_STATE_SPACE; j++) {
+            current_row_sum += fabs(a[i][j] - b[i][j]);
+        }
+        if (current_row_sum > max_row_sum) {
+            max_row_sum = current_row_sum;
+        }
+    }
+
+    return max_row_sum;
+}
+
+/*
  * Normalize the Markov transition count matrix into a probability matrix
  *
  * @param count_matrix   Raw transition counts (input)
@@ -148,10 +192,10 @@ void remove_ukw_flow(flow_t key) {
 }
 
 flow_table_t *promote_ukw_to_identified(flow_t key, ukw_flow_table_t *ukw_entry, CaptureContext *ctx) {
-    // Remove from unknown table first 
+    // Remove from unknown table first
     HASH_DEL(ukw_flow_table, ukw_entry);
 
-    // Seed the global Markov model with states accumulated in the buffer 
+    // Seed the global Markov model with states accumulated in the buffer
     if (ctx != NULL && ukw_entry->packet_count > 1) {
         for (uint32_t i = 1; i < ukw_entry->packet_count; i++) {
             uint8_t prev = ukw_entry->state_buff[(i - 1) % NDPI_GIVEUP_THRESHOLD];
@@ -161,10 +205,10 @@ flow_table_t *promote_ukw_to_identified(flow_t key, ukw_flow_table_t *ukw_entry,
         ctx->markov.last_state = (int8_t)ukw_entry->state_buff[(ukw_entry->packet_count - 1) % NDPI_GIVEUP_THRESHOLD];
     }
 
-    // Add to identified flow table 
+    // Add to identified flow table
     flow_table_t *flow_entry = add_flow(key, ukw_entry->ndpi_flow);
 
-    // Free the ukw_entry struct — its ndpi_flow was transferred to flow_table 
+    // Free the ukw_entry struct — its ndpi_flow was transferred to flow_table
     free(ukw_entry);
 
     return flow_entry;

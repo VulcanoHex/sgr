@@ -16,7 +16,7 @@ static void print_usage() {
     printf("  -l IP                    Inbound IP address for pcap file\n");
     printf("  -o PATH                  RRD database path (default: /tmp/netflow_metrics.rrd)   WIP\n");
     printf("  -t VAL                   Anomaly probability threshold (default: 0.01)\n");
-    printf("  -c VAL                   Convergence delta threshold (default: 0.001)\n");
+    printf("  -c VAL                   Markov Matrix convergence threshold (default: 0.0001 => 0.01%%)\n");
     printf("  -m NUM                   Maximum concurrent flows (default: 100000)\n");
     printf("  -f EXPR                  BPF filter expression\n");
     printf("  -h                       Show this help\n");
@@ -102,7 +102,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-
+    config.norm_interval_check = 1000;
     char errbuf[PCAP_ERRBUF_SIZE];
     if (!config.live_capture && config.pcap_file != NULL) {
         pcap_t *handle = pcap_open_offline(config.pcap_file, errbuf);
@@ -114,8 +114,11 @@ int main(int argc, char *argv[]) {
         }
 
         CaptureContext ctx;
+        ctx.has_last_probability_matrix = false;
+        ctx.training_done = false;
         ctx.handle = handle;
         ctx.config = &config;
+        memset(&ctx.last_probability_matrix, 0, sizeof(ctx.last_probability_matrix));
         memset(&ctx.markov, 0, sizeof(markov_model_t));
         ctx.markov.last_state = -1;
 
@@ -127,19 +130,19 @@ int main(int argc, char *argv[]) {
 
         pcap_loop(handle, -1, offline_packet_callback,(u_char *) &ctx);
 
-        // Post-processing: normalize and print global Markov transition probability matrix 
+        // Post-processing: normalize and print global Markov transition probability matrix
         printf("\n=== Global Markov Transition Probability Matrix ===\n\n");
         double prob_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
         normalize_markov_matrix(ctx.markov.transition_matrix, prob_matrix);
 
-        // Print state labels 
-        printf("       ");
+        // Print state labels
+        printf("   ");
         for (int j = 0; j < MARKOV_STATE_SPACE; j++) {
             printf("%5d ", j);
         }
         printf("\n");
 
-        // Print probability matrix 
+        // Print probability matrix
         for (int i = 0; i < MARKOV_STATE_SPACE; i++) {
             printf("  %2d|", i);
             for (int j = 0; j < MARKOV_STATE_SPACE; j++) {

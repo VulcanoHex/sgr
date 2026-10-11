@@ -1,5 +1,6 @@
 #include <net/ethernet.h>
 #include <netinet/in.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,15 +155,27 @@ uint32_t get_local_ip_from_interface(CaptureContext *ctx) {
     return 0;
 }
 
+// Computes direction and Markov state
+static inline uint8_t get_packet_state(const flow_nn_t *flow_nn, const CaptureContext *ctx, uint32_t caplen) {
+    int direction = (flow_nn->local_ip == ctx->config->local_ip) ? 1 : 0;
+    return compute_markov_state(direction, caplen);
+}
 
-/*
- * Packet callback
- * Main function da eseguire per ogni pacchetto.
- * Deve contenere tutta la logica di analisi del pacchetto.
- * Deve essere thread-safe.
- * Tutti i dati in analisi devono essere nell'pointer user (pcap_context_t).
- */
-void offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
+// Handles TLS/QUIC check and promotion logic
+static inline bool check_and_promote_if_target_proto(ndpi_protocol proto, flow_t flow, ukw_flow_table_t *ukw_entry, CaptureContext *ctx) {
+    if (ndpi_is_proto(proto.proto, NDPI_PROTOCOL_TLS) ||
+        ndpi_is_proto(proto.proto, NDPI_PROTOCOL_QUIC)) {
+        printf("[detected] flow -> TLS/QUIC\n");
+        promote_ukw_to_identified(flow, ukw_entry, ctx);
+        return true;
+    }
+    return false;
+}
+
+
+
+
+void train_matrix_offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
     // Casto il pointer user a CaptureContext
     CaptureContext *ctx = (CaptureContext *)user;
     // Estraggo il detection module
@@ -179,112 +192,116 @@ void offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, con
     flow_t flow = normalize_topologic_flow(flow_nn, ctx->config->local_ip);
 
     // debug: stampa il flusso
-    printf("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
-        (flow.local_ip >> 24) & 0xFF, (flow.local_ip >> 16) & 0xFF, (flow.local_ip >> 8) & 0xFF, flow.local_ip & 0xFF,
-        flow.local_port,
-        (flow.remote_ip >> 24) & 0xFF, (flow.remote_ip >> 16) & 0xFF, (flow.remote_ip >> 8) & 0xFF, flow.remote_ip & 0xFF,
-        flow.remote_port);
+    // printf("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
+    //     (flow.local_ip >> 24) & 0xFF, (flow.local_ip >> 16) & 0xFF, (flow.local_ip >> 8) & 0xFF, flow.local_ip & 0xFF,
+    //     flow.local_port,
+    //     (flow.remote_ip >> 24) & 0xFF, (flow.remote_ip >> 16) & 0xFF, (flow.remote_ip >> 8) & 0xFF, flow.remote_ip & 0xFF,
+    //     flow.remote_port);
 
     if (flow.layer4_protocol == 0) {
         return;
     }
 
+
     // is flow already identified?
-    flow_table_t *flow_entry;
-    flow_entry = find_flow(flow);
+    flow_table_t *flow_entry = find_flow(flow);
     if (flow_entry != NULL) {
         // Identified flow — feed packet into existing NDPI detector
         // packet needs packet pointer at layer 3 (*packet + offsettolayer3)
         // packlen = caplen - offsettolayer3?
         ndpi_detection_process_packet(ctx->ndpi_struct, flow_entry->ndpi_flow, packet+l3offset, caplen-l3offset, time_ms, NULL);
 
-        // Update global Markov transition matrix 
-        int direction = (flow_nn.local_ip == ctx->config->local_ip) ? 1 : 0;
-        uint8_t state = compute_markov_state(direction, caplen);
+        uint8_t state = get_packet_state(&flow_nn, ctx, caplen);
 
         if (ctx->markov.last_state >= 0) {
             ctx->markov.transition_matrix[ctx->markov.last_state][state]++;
         }
         ctx->markov.last_state = (int8_t)state;
 
+        // counts packets only in already identified flows
+        ctx->packets_from_last_norm++;
+
         flow_entry->packet_count++;
         flow_entry->last_seen_ms = time_ms;
+
+        if(ctx->packets_from_last_norm >= ctx->config->norm_interval_check && infinity_norm(ctx->markov.transition_matrix)>= 1){
+        	if(ctx->has_last_probability_matrix){
+          		double current_probability[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
+            	normalize_markov_matrix(ctx->markov.transition_matrix, current_probability);
+             	double delta = delta_prob_norm(ctx->last_probability_matrix, current_probability);
+             	printf("Current probability norm:%f\n", delta);
+              	if (delta <= ctx->config->convergence){
+               		ctx->training_done = true;
+               	}
+              	memcpy(ctx->last_probability_matrix, current_probability, sizeof(current_probability));
+              	ctx->packets_from_last_norm = 0;
+         	}
+         	else {
+         		normalize_markov_matrix(ctx->markov.transition_matrix, ctx->last_probability_matrix);
+           		ctx->has_last_probability_matrix = true;
+             	ctx->packets_from_last_norm = 0;
+         	}
+        }
     }
     else {
-        // Unknown flow — search in the unknown flow table
+
+   		// Handles Unknown Flows (Lookup or Create)
         ukw_flow_table_t *ukw_entry = find_ukw_flow(flow);
-        if (ukw_entry != NULL) {
-            // Found in unknown table — compute Markov state and append to buffer
-            int direction = (flow_nn.local_ip == ctx->config->local_ip) ? 1 : 0;
-            uint8_t state = compute_markov_state(direction, caplen);
-            ukw_entry->state_buff[ukw_entry->packet_count % NDPI_GIVEUP_THRESHOLD] = state;
-            ukw_entry->packet_count++;
-            ukw_entry->last_seen_ms = time_ms;
+        bool is_new_flow = (ukw_entry == NULL);
 
-            // Feed packet to NDPI to try to identify the flow
-            ndpi_protocol proto = ndpi_detection_process_packet(ctx->ndpi_struct, ukw_entry->ndpi_flow, packet+l3offset, caplen-l3offset, time_ms, NULL);
-
-            // Check if NDPI has detected a known protocol (TLS or QUIC)
-            int promoted = 0;
-            if (ndpi_is_proto(proto.proto , NDPI_PROTOCOL_TLS) ||
-                ndpi_is_proto(proto.proto, NDPI_PROTOCOL_QUIC)) {
-                printf("[detected] flow -> TLS/QUIC\n");
-                flow_table_t *promoted_flow = promote_ukw_to_identified(flow, ukw_entry, ctx);
-                if (promoted_flow != NULL) {
-                    /* last_state is already updated in global ctx->markov by promote_ukw_to_identified */
-                }
-                promoted = 1;
-            }
-
-            // Only check giveup if the flow was NOT promoted (ukw_entry still valid) 
-            if (!promoted && ukw_entry->packet_count >= NDPI_GIVEUP_THRESHOLD) {
-                if (!ndpi_is_protocol_detected(proto)) {
-                    printf("[giveup] flow not identified, removing\n");
-                    remove_ukw_flow(flow);
-                }
-            }
-        }
-        else {
-            // Not in unknown table — create entry and initialize NDPI flow
+        if (is_new_flow) {
             ukw_entry = add_ukw_flow(flow);
-            if (ukw_entry == NULL) {
-                return;
-            }
-            // allocate mem and set to zero
+            if (ukw_entry == NULL) return;
+
             ukw_entry->ndpi_flow = (struct ndpi_flow_struct *)calloc(1, sizeof(struct ndpi_flow_struct));
             if (ukw_entry->ndpi_flow == NULL) {
                 fprintf(stderr, "Failed to allocate NDPI flow\n");
                 return;
             }
+            ukw_entry->packet_count = 0; // Will be set to 1 on buffer placement
+        }
+        u_int8_t state = get_packet_state(&flow_nn, ctx, caplen);
+        if (is_new_flow){
+        	ukw_entry->state_buff[0] = state;
+         	ukw_entry->packet_count = 1;
+        }
+        else {
+        	ukw_entry->state_buff[ukw_entry->packet_count % NDPI_GIVEUP_THRESHOLD] = state;
+         	ukw_entry->packet_count++;
+        }
+        ukw_entry->last_seen_ms = time_ms;
 
-            // Store the state of the first packet in the buffer
-            int direction = (flow_nn.local_ip == ctx->config->local_ip) ? 1 : 0;
-            uint8_t state = compute_markov_state(direction, caplen);
-            ukw_entry->state_buff[0] = state;
+        // Feeds packet to NDPI
+        ndpi_protocol proto = ndpi_detection_process_packet(ctx->ndpi_struct, ukw_entry->ndpi_flow, packet+l3offset, caplen-l3offset, time_ms, NULL);
 
-            // Set flow addresses so NDPI can track it
-            ukw_entry->packet_count = 1;
-            ukw_entry->last_seen_ms = time_ms;
+        // Checks for promotions of give-up
+        bool promoted = check_and_promote_if_target_proto(proto, flow, ukw_entry, ctx);
 
-            // Feed the first packet to NDPI
-            ndpi_protocol proto = ndpi_detection_process_packet(ctx->ndpi_struct, ukw_entry->ndpi_flow, packet+l3offset, caplen-l3offset, time_ms, NULL);
-
-            // Check if NDPI has detected a known protocol (TLS or QUIC)
-            if (ndpi_is_proto(proto.proto , NDPI_PROTOCOL_TLS) ||
-                ndpi_is_proto(proto.proto, NDPI_PROTOCOL_QUIC)) {
-                printf("[detected] flow -> TLS/QUIC\n");
-                flow_table_t *promoted_flow = promote_ukw_to_identified(flow, ukw_entry, ctx);
-                if (promoted_flow != NULL) {
-                    // last_state is already updated in global ctx->markov by promote_ukw_to_identified 
-                }
-            }
-
+        if (!promoted && !is_new_flow && ukw_entry->packet_count >=NDPI_GIVEUP_THRESHOLD){
+        	if(!ndpi_is_protocol_detected(proto)){
+         		printf("[giveup] flow not identified, removing\n");
+           		remove_ukw_flow(flow);
+         	}
         }
     }
+}
 
-    //...
 
-    // Analizzo il pacchetto con NDPI
-    // ndpi_struct
-
+/*
+ * Packet callback
+ * Main function da eseguire per ogni pacchetto.
+ * Deve contenere tutta la logica di analisi del pacchetto.
+ * Deve essere thread-safe.
+ * Tutti i dati in analisi devono essere nell'pointer user (pcap_context_t).
+ */
+void offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet){
+ 	// Casto il pointer user a CaptureContext
+    CaptureContext *ctx = (CaptureContext *)user;
+    if (ctx->training_done){
+    	printf("training done!\n");
+    	return;
+    }
+    else {
+    	train_matrix_offline_packet_callback(user, pkthdr, packet);
+    }
 }

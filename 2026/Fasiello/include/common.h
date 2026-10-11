@@ -22,7 +22,7 @@
 
 #define MARKOV_STATE_SPACE 12
 
-// Forward declaration — full definition is in ndpi_api.h, included by consumers 
+// Forward declaration — full definition is in ndpi_api.h, included by consumers
 struct ndpi_flow_struct;
 
 #define NDPI_GIVEUP_THRESHOLD 16
@@ -41,6 +41,7 @@ typedef struct {
     double convergence;
     uint32_t max_flows;
     char *filter;
+    uint32_t norm_interval_check;
 } Config;
 
 // Modello markoviano globale
@@ -56,6 +57,10 @@ typedef struct{
     struct ndpi_detection_module_struct *ndpi_struct;   // ndpi?
     // altri dati da mettere nel detector vanno qui
     markov_model_t markov;
+    uint32_t packets_from_last_norm;		// Only counts packets once the flow is identified
+    double last_probability_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
+    bool has_last_probability_matrix;
+    bool training_done;
 
 } CaptureContext;
 
