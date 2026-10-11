@@ -178,8 +178,6 @@ static inline bool check_and_promote_if_target_proto(ndpi_protocol proto, flow_t
 void train_matrix_offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
     // Casto il pointer user a CaptureContext
     CaptureContext *ctx = (CaptureContext *)user;
-    // Estraggo il detection module
-    struct ndpi_detection_module_struct *ndpi_struct = ctx->ndpi_struct;
 
     // Estraggo lunghezza e timestamp del pacchetto
     uint16_t caplen = pkthdr->caplen;
@@ -191,60 +189,65 @@ void train_matrix_offline_packet_callback(u_char *user, const struct pcap_pkthdr
     // Normalizzo il flusso
     flow_t flow = normalize_topologic_flow(flow_nn, ctx->config->local_ip);
 
-    // debug: stampa il flusso
-    // printf("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
-    //     (flow.local_ip >> 24) & 0xFF, (flow.local_ip >> 16) & 0xFF, (flow.local_ip >> 8) & 0xFF, flow.local_ip & 0xFF,
-    //     flow.local_port,
-    //     (flow.remote_ip >> 24) & 0xFF, (flow.remote_ip >> 16) & 0xFF, (flow.remote_ip >> 8) & 0xFF, flow.remote_ip & 0xFF,
-    //     flow.remote_port);
-
     if (flow.layer4_protocol == 0) {
         return;
     }
-
 
     // is flow already identified?
     flow_table_t *flow_entry = find_flow(flow);
     if (flow_entry != NULL) {
         // Identified flow — feed packet into existing NDPI detector
-        // packet needs packet pointer at layer 3 (*packet + offsettolayer3)
-        // packlen = caplen - offsettolayer3?
         ndpi_detection_process_packet(ctx->ndpi_struct, flow_entry->ndpi_flow, packet+l3offset, caplen-l3offset, time_ms, NULL);
 
         uint8_t state = get_packet_state(&flow_nn, ctx, caplen);
 
-        if (ctx->markov.last_state >= 0) {
-            ctx->markov.transition_matrix[ctx->markov.last_state][state]++;
-        }
-        ctx->markov.last_state = (int8_t)state;
+        // Se il flusso ha completato il training, verifichiamo la probabilità di transizione (rilevamento anomalie)
+        if (flow_entry->training_done) {
+            if (flow_entry->markov.last_state >= 0) {
+                double current_prob[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
+                normalize_markov_matrix(flow_entry->markov.transition_matrix, current_prob);
+                double trans_prob = current_prob[flow_entry->markov.last_state][state];
 
-        // counts packets only in already identified flows
-        ctx->packets_from_last_norm++;
+                if (trans_prob < ctx->config->threshold) {
+                    // Anomalia rilevata: transizione sotto soglia
+                    flow_entry->anomaly_detected = true;
+                }
+            }
+            flow_entry->markov.last_state = (int8_t)state;
+        } else {
+            // Fase di Training per-flusso
+            if (flow_entry->markov.last_state >= 0) {
+                flow_entry->markov.transition_matrix[flow_entry->markov.last_state][state]++;
+            }
+            flow_entry->markov.last_state = (int8_t)state;
+            flow_entry->packets_from_last_norm++;
+
+            flow_entry->packet_count++;
+            flow_entry->last_seen_ms = time_ms;
+
+            if (flow_entry->packets_from_last_norm >= ctx->config->norm_interval_check && 
+                infinity_norm(flow_entry->markov.transition_matrix) >= 1) {
+                
+                double current_probability[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
+                normalize_markov_matrix(flow_entry->markov.transition_matrix, current_probability);
+
+                if (flow_entry->has_last_probability_matrix) {
+                    double delta = delta_prob_norm(flow_entry->last_probability_matrix, current_probability);
+                    if (delta <= ctx->config->convergence) {
+                        flow_entry->training_done = true;
+                        printf("[training] Flow converged and frozen!\n");
+                    }
+                }
+                memcpy(flow_entry->last_probability_matrix, current_probability, sizeof(current_probability));
+                flow_entry->has_last_probability_matrix = true;
+                flow_entry->packets_from_last_norm = 0;
+            }
+        }
 
         flow_entry->packet_count++;
         flow_entry->last_seen_ms = time_ms;
-
-        if(ctx->packets_from_last_norm >= ctx->config->norm_interval_check && infinity_norm(ctx->markov.transition_matrix)>= 1){
-        	if(ctx->has_last_probability_matrix){
-          		double current_probability[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
-            	normalize_markov_matrix(ctx->markov.transition_matrix, current_probability);
-             	double delta = delta_prob_norm(ctx->last_probability_matrix, current_probability);
-             	printf("Current probability norm:%f\n", delta);
-              	if (delta <= ctx->config->convergence){
-               		ctx->training_done = true;
-               	}
-              	memcpy(ctx->last_probability_matrix, current_probability, sizeof(current_probability));
-              	ctx->packets_from_last_norm = 0;
-         	}
-         	else {
-         		normalize_markov_matrix(ctx->markov.transition_matrix, ctx->last_probability_matrix);
-           		ctx->has_last_probability_matrix = true;
-             	ctx->packets_from_last_norm = 0;
-         	}
-        }
     }
     else {
-
    		// Handles Unknown Flows (Lookup or Create)
         ukw_flow_table_t *ukw_entry = find_ukw_flow(flow);
         bool is_new_flow = (ukw_entry == NULL);
@@ -258,7 +261,7 @@ void train_matrix_offline_packet_callback(u_char *user, const struct pcap_pkthdr
                 fprintf(stderr, "Failed to allocate NDPI flow\n");
                 return;
             }
-            ukw_entry->packet_count = 0; // Will be set to 1 on buffer placement
+            ukw_entry->packet_count = 0;
         }
         u_int8_t state = get_packet_state(&flow_nn, ctx, caplen);
         if (is_new_flow){
@@ -277,7 +280,7 @@ void train_matrix_offline_packet_callback(u_char *user, const struct pcap_pkthdr
         // Checks for promotions of give-up
         bool promoted = check_and_promote_if_target_proto(proto, flow, ukw_entry, ctx);
 
-        if (!promoted && !is_new_flow && ukw_entry->packet_count >=NDPI_GIVEUP_THRESHOLD){
+        if (!promoted && !is_new_flow && ukw_entry->packet_count >= NDPI_GIVEUP_THRESHOLD){
         	if(!ndpi_is_protocol_detected(proto)){
          		printf("[giveup] flow not identified, removing\n");
            		remove_ukw_flow(flow);
@@ -296,12 +299,5 @@ void train_matrix_offline_packet_callback(u_char *user, const struct pcap_pkthdr
  */
 void offline_packet_callback(u_char *user, const struct pcap_pkthdr *pkthdr, const u_char *packet){
  	// Casto il pointer user a CaptureContext
-    CaptureContext *ctx = (CaptureContext *)user;
-    if (ctx->training_done){
-    	printf("training done!\n");
-    	return;
-    }
-    else {
-    	train_matrix_offline_packet_callback(user, pkthdr, packet);
-    }
+    train_matrix_offline_packet_callback(user, pkthdr, packet);
 }

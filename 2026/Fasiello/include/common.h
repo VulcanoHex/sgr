@@ -44,10 +44,10 @@ typedef struct {
     uint32_t norm_interval_check;
 } Config;
 
-// Modello markoviano globale
+// Modello markoviano per singolo flusso
 typedef struct {
-	uint32_t transition_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
-	int8_t last_state;                  // Ultimo stato visto globalmente (-1 all'avvio)
+    uint32_t transition_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
+    int8_t last_state;                  // Ultimo stato visto nel flusso (-1 all'avvio)
 } markov_model_t;
 
 // Anche questo va nel coso comune
@@ -56,12 +56,7 @@ typedef struct{
     Config *config;
     struct ndpi_detection_module_struct *ndpi_struct;   // ndpi?
     // altri dati da mettere nel detector vanno qui
-    markov_model_t markov;
-    uint32_t packets_from_last_norm;		// Only counts packets once the flow is identified
-    double last_probability_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
-    bool has_last_probability_matrix;
     bool training_done;
-
 } CaptureContext;
 
 // Struct per identificare univocamente un flusso (only IPV4)
@@ -90,6 +85,15 @@ typedef struct {
 
     uint32_t packet_count;                  // Numero di pacchetti
     uint32_t last_seen_ms;                  // Timestamp dell'ultimo pacchetto ricevuto
+
+    // Modello Markoviano e stato di training per-flusso
+    markov_model_t markov;
+    uint32_t packets_from_last_norm;
+    double last_probability_matrix[MARKOV_STATE_SPACE][MARKOV_STATE_SPACE];
+    bool has_last_probability_matrix;
+    bool training_done;
+    bool anomaly_detected;                  // Flag o contatore di anomalie
+
     UT_hash_handle hh;
 } flow_table_t;
 

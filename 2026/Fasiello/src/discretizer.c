@@ -37,8 +37,10 @@ flow_table_t *add_flow(flow_t key, struct ndpi_flow_struct *ndpi_flow) {
             fprintf(stderr, "Failed to allocate memory for flow entry\n");
             return NULL;
         }
+        memset(entry, 0, sizeof(flow_table_t));
         entry->key = key;
         entry->ndpi_flow = ndpi_flow;
+        entry->markov.last_state = -1;
         HASH_ADD(hh, flow_table, key, sizeof(flow_t), entry);
     }
     else {
@@ -195,18 +197,18 @@ flow_table_t *promote_ukw_to_identified(flow_t key, ukw_flow_table_t *ukw_entry,
     // Remove from unknown table first
     HASH_DEL(ukw_flow_table, ukw_entry);
 
-    // Seed the global Markov model with states accumulated in the buffer
-    if (ctx != NULL && ukw_entry->packet_count > 1) {
+    // Add to identified flow table
+    flow_table_t *flow_entry = add_flow(key, ukw_entry->ndpi_flow);
+
+    // Seed the per-flow Markov model with states accumulated in the buffer
+    if (flow_entry != NULL && ukw_entry->packet_count > 1) {
         for (uint32_t i = 1; i < ukw_entry->packet_count; i++) {
             uint8_t prev = ukw_entry->state_buff[(i - 1) % NDPI_GIVEUP_THRESHOLD];
             uint8_t curr = ukw_entry->state_buff[i % NDPI_GIVEUP_THRESHOLD];
-            ctx->markov.transition_matrix[prev][curr]++;
+            flow_entry->markov.transition_matrix[prev][curr]++;
         }
-        ctx->markov.last_state = (int8_t)ukw_entry->state_buff[(ukw_entry->packet_count - 1) % NDPI_GIVEUP_THRESHOLD];
+        flow_entry->markov.last_state = (int8_t)ukw_entry->state_buff[(ukw_entry->packet_count - 1) % NDPI_GIVEUP_THRESHOLD];
     }
-
-    // Add to identified flow table
-    flow_table_t *flow_entry = add_flow(key, ukw_entry->ndpi_flow);
 
     // Free the ukw_entry struct — its ndpi_flow was transferred to flow_table
     free(ukw_entry);
